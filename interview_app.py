@@ -37,10 +37,6 @@ mp_drawing        = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
 # ── 튜닝 상수 ─────────────────────────────────────────────────────────────
-GAZE_H_THRESHOLD   = 0.28   # 0.33 → 0.28 완화
-GAZE_V_TOP         = 0.22   # 위쪽 한계 (이보다 작으면 불안정)
-GAZE_V_BOTTOM      = 0.82   # 아래쪽 한계 (이보다 크면 불안정)
-GAZE_CONSEC_FRAMES = 3      # 연속 몇 프레임 이탈해야 불안정으로 카운트
 SHOULDER_ANGLE_MAX = 10.0
 INSTABILITY_FRAMES = 12
 HISTORY_WINDOW     = 30
@@ -66,11 +62,6 @@ YAW_MAX   = 20.0
 PITCH_MAX = 15.0
 ROLL_MAX  = 10.0
 
-# 눈 깜빡임
-EAR_THRESHOLD  = 0.21   # 이 값 이하면 눈 감음
-BLINK_BPM_LOW  = 10     # 분당 깜빡임 정상 하한
-BLINK_BPM_HIGH = 25     # 분당 깜빡임 정상 상한
-
 # 고개 자세 계산용 3D 기준점 (정면 얼굴 모델)
 _MODEL_POINTS = np.array([
     [0.0,    0.0,    0.0   ],   # 코끝 (1)
@@ -89,82 +80,129 @@ _LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
 
 # ── 시선 분석기 ───────────────────────────────────────────────────────────
 class GazeAnalyzer:
+    """픽셀 기반 Safe Zone으로 시선 이탈 감지 (Rogers et al., 2018).
+    화면 중앙 상단 가로 40%, 세로 35% 영역을 기준으로 연속 3초 이탈 시 1회 카운트.
+    세션 5회 이상 이탈 → warn=True."""
+    SAFE_W_RATIO = 0.40
+    SAFE_H_RATIO = 0.35
+    DEVIATE_SEC  = 3.0
+    MAX_EVENTS   = 5
+
     def __init__(self):
-        self.history: deque[bool] = deque(maxlen=HISTORY_WINDOW)
-        self._raw_consec = 0   # 연속 이탈 프레임 카운터
+        self._deviate_start: float | None = None
+        self._last_count_end: float       = -999.0
+        self.deviate_events: int          = 0
 
-    def _iris_ratio(self, lm, iris_idx, bound, img_w, img_h):
-        ix = lm[iris_idx].x * img_w
-        iy = lm[iris_idx].y * img_h
-        lx = lm[bound["left"]].x   * img_w
-        rx = lm[bound["right"]].x  * img_w
-        ty = lm[bound["top"]].y    * img_h
-        by = lm[bound["bottom"]].y * img_h
-        return (ix - lx) / (rx - lx + 1e-6), (iy - ty) / (by - ty + 1e-6)
+    def safe_zone(self, img_w, img_h):
+        """Safe Zone (x1, x2, y1, y2) 픽셀 좌표 반환."""
+        cx = img_w / 2
+        hw = img_w * self.SAFE_W_RATIO / 2
+        return int(cx - hw), int(cx + hw), 0, int(img_h * self.SAFE_H_RATIO)
 
-    def analyze(self, face_landmarks, img_w, img_h):
+    def analyze(self, face_landmarks, img_w, img_h, now: float):
+        """(warn, iris_px, is_unstable, safe_zone) 반환."""
         lm = face_landmarks.landmark
         try:
-            rh, rv = self._iris_ratio(lm, RIGHT_IRIS_CENTER, RIGHT_EYE_BOUND, img_w, img_h)
-            lh, lv = self._iris_ratio(lm, LEFT_IRIS_CENTER,  LEFT_EYE_BOUND,  img_w, img_h)
+            iris_x = (lm[RIGHT_IRIS_CENTER].x + lm[LEFT_IRIS_CENTER].x) / 2 * img_w
+            iris_y = (lm[RIGHT_IRIS_CENTER].y + lm[LEFT_IRIS_CENTER].y) / 2 * img_h
         except Exception:
-            self._raw_consec = 0
-            self.history.append(False)
-            return False, (0.5, 0.5), False
+            self._deviate_start = None
+            return False, (img_w / 2, img_h / 2), False, self.safe_zone(img_w, img_h)
 
-        avg_h = (rh + lh) / 2
-        avg_v = (rv + lv) / 2
+        x1, x2, y1, y2 = self.safe_zone(img_w, img_h)
+        raw_deviated = not (x1 <= iris_x <= x2 and y1 <= iris_y <= y2)
 
-        # 이번 프레임의 원시 이탈 여부
-        raw_deviated = (
-            avg_h < GAZE_H_THRESHOLD or avg_h > (1 - GAZE_H_THRESHOLD) or
-            avg_v < GAZE_V_TOP       or avg_v > GAZE_V_BOTTOM
-        )
-
-        # 연속 프레임 카운터 갱신
         if raw_deviated:
-            self._raw_consec += 1
+            if self._deviate_start is None:
+                self._deviate_start = now
+            # 연속 3초 이탈이고, 마지막 카운트 이후 새 이탈이면 1회 추가
+            elif (now - self._deviate_start >= self.DEVIATE_SEC and
+                  self._deviate_start > self._last_count_end):
+                self.deviate_events += 1
+                self._last_count_end  = now
+                self._deviate_start   = now   # 다음 3초 카운트를 위해 리셋
         else:
-            self._raw_consec = 0
+            self._deviate_start = None
 
-        # GAZE_CONSEC_FRAMES 이상 연속 이탈해야 불안정으로 인정
-        unstable = self._raw_consec >= GAZE_CONSEC_FRAMES
-
-        self.history.append(unstable)
-        warn = sum(self.history) >= INSTABILITY_FRAMES
-        return warn, (avg_h, avg_v), unstable
+        warn = self.deviate_events >= self.MAX_EVENTS
+        return warn, (iris_x, iris_y), raw_deviated, (x1, x2, y1, y2)
 
 
 # ── 자세 분석기 ───────────────────────────────────────────────────────────
 class PostureAnalyzer:
+    """어깨 기울기 5초 지속 판정 + FaceMesh 바운딩박스 기반 손 제스처 감지."""
+    SHOULDER_PERSIST_SEC = 5.0
+    GESTURE_WARN_COUNT   = 3
+
+    # 손목·손가락 끝 Pose 랜드마크 인덱스
+    _HAND_LM = [
+        mp_pose.PoseLandmark.LEFT_WRIST,   mp_pose.PoseLandmark.RIGHT_WRIST,
+        mp_pose.PoseLandmark.LEFT_INDEX,   mp_pose.PoseLandmark.RIGHT_INDEX,
+        mp_pose.PoseLandmark.LEFT_PINKY,   mp_pose.PoseLandmark.RIGHT_PINKY,
+        mp_pose.PoseLandmark.LEFT_THUMB,   mp_pose.PoseLandmark.RIGHT_THUMB,
+    ]
+
     def __init__(self):
-        self.history: deque[bool] = deque(maxlen=HISTORY_WINDOW)
+        self._tilt_start: float | None = None
+        self._tilt_warn                = False
+        self.gesture_count: int        = 0
+        self._hand_was_in_face         = False
 
     def _shoulder_angle(self, lm):
         ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
         rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
         return abs(np.degrees(np.arctan2(rs.y - ls.y, abs(rs.x - ls.x))))
 
-    def _hand_raised(self, lm):
-        ls_y = lm[mp_pose.PoseLandmark.LEFT_SHOULDER].y
-        rs_y = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER].y
-        sh_y = (ls_y + rs_y) / 2
-        lw   = lm[mp_pose.PoseLandmark.LEFT_WRIST]
-        rw   = lm[mp_pose.PoseLandmark.RIGHT_WRIST]
-        return (lw.visibility > 0.5 and lw.y < sh_y) or \
-               (rw.visibility > 0.5 and rw.y < sh_y)
+    def _face_bbox(self, face_lm, img_w, img_h):
+        xs = [p.x * img_w for p in face_lm.landmark]
+        ys = [p.y * img_h for p in face_lm.landmark]
+        return int(min(xs)), int(max(xs)), int(min(ys)), int(max(ys))
 
-    def analyze(self, pose_landmarks):
+    def _hand_in_face(self, pose_lm, x1, x2, y1, y2, img_w, img_h):
+        lm = pose_lm.landmark
+        for idx in self._HAND_LM:
+            pt = lm[idx]
+            if pt.visibility < 0.5:
+                continue
+            px, py = pt.x * img_w, pt.y * img_h
+            if x1 <= px <= x2 and y1 <= py <= y2:
+                return True
+        return False
+
+    def analyze(self, pose_landmarks, now: float,
+                face_lm=None, img_w: int = 0, img_h: int = 0):
         lm     = pose_landmarks.landmark
         issues = []
         angle  = self._shoulder_angle(lm)
+
+        # 어깨 기울기: 5초 이상 지속될 때만 불안정 판정
         if angle > SHOULDER_ANGLE_MAX:
-            issues.append(f"Shoulder tilt {angle:.1f}deg")
-        if self._hand_raised(lm):
-            issues.append("Hand position unstable")
-        unstable = bool(issues)
-        self.history.append(unstable)
-        warn = sum(self.history) >= INSTABILITY_FRAMES
+            if self._tilt_start is None:
+                self._tilt_start = now
+            elif now - self._tilt_start >= self.SHOULDER_PERSIST_SEC:
+                self._tilt_warn = True
+                issues.append(f"Shoulder tilt {angle:.1f}deg")
+        else:
+            self._tilt_start = None
+            self._tilt_warn  = False
+
+        # 손 제스처: FaceMesh 바운딩박스 침범 → 엣지 트리거로 카운트
+        hand_now = False
+        if face_lm is not None and img_w > 0 and img_h > 0:
+            x1, x2, y1, y2 = self._face_bbox(face_lm, img_w, img_h)
+            hand_now = self._hand_in_face(pose_landmarks, x1, x2, y1, y2, img_w, img_h)
+            if hand_now and not self._hand_was_in_face:
+                self.gesture_count += 1
+            if hand_now:
+                issues.append("Hand near face")
+        self._hand_was_in_face = hand_now
+
+        gesture_warn = self.gesture_count >= self.GESTURE_WARN_COUNT
+        if gesture_warn:
+            issues.append(f"Hand gesture x{self.gesture_count}")
+
+        unstable = self._tilt_warn or hand_now
+        warn     = self._tilt_warn or gesture_warn
         return warn, angle, issues, unstable
 
 
@@ -224,17 +262,25 @@ class HeadPoseAnalyzer:
 
 # ── 눈 깜빡임 분석기 ──────────────────────────────────────────────────────
 class BlinkAnalyzer:
-    """EAR(Eye Aspect Ratio)로 깜빡임을 감지하고 분당 횟수를 계산합니다."""
+    """10초 단위 구간 기반 깜빡임 분석.
+    과긴장: 10초에 7회 초과 (≈42/min, 평균+2.5SD, Bentivoglio 1997 / Haak 2008)
+    긴장 경직: 10초에 1회 이하 (집중 시 감소, Doughty 2001)"""
+    EAR_THRESHOLD    = 0.20
+    INTERVAL_SEC     = 10.0
+    BLINK_HIGH_PER10 = 7   # 10초에 7회 초과 → 과긴장
+    BLINK_LOW_PER10  = 1   # 10초에 1회 이하 → 긴장 경직
 
     def __init__(self):
-        self._eye_closed  = False          # 이전 프레임 눈 감김 여부
-        self._blink_times: deque[float] = deque()  # 최근 60초 깜빡임 타임스탬프
-        self.total_blinks = 0
+        self._eye_closed      = False
+        self._interval_start: float | None = None
+        self._interval_blinks = 0
+        self._last_status     = "normal"   # "normal" / "hyper" / "rigid"
+        self.total_blinks     = 0
+        self._blink_times: deque[float] = deque()  # BPM 표시용 60초 rolling
 
     @staticmethod
     def _ear(lm, indices, img_w, img_h):
         pts = np.array([(lm[i].x * img_w, lm[i].y * img_h) for i in indices])
-        # EAR = (‖p2-p6‖ + ‖p3-p5‖) / (2·‖p1-p4‖)
         A = np.linalg.norm(pts[1] - pts[5])
         B = np.linalg.norm(pts[2] - pts[4])
         C = np.linalg.norm(pts[0] - pts[3]) + 1e-6
@@ -246,24 +292,37 @@ class BlinkAnalyzer:
         ear = (self._ear(lm, _RIGHT_EYE_EAR, img_w, img_h) +
                self._ear(lm, _LEFT_EYE_EAR,  img_w, img_h)) / 2.0
 
-        # 눈 감김 → 열림 전환 시 깜빡임 1회 카운트
+        if self._interval_start is None:
+            self._interval_start = now
+
         blinked = False
-        if ear < EAR_THRESHOLD:
+        if ear < self.EAR_THRESHOLD:
             self._eye_closed = True
         elif self._eye_closed:
             self._eye_closed = False
-            self._blink_times.append(now)
+            self._interval_blinks += 1
             self.total_blinks += 1
+            self._blink_times.append(now)
             blinked = True
 
-        # 60초 이전 데이터 제거
+        # 10초 구간 평가 후 초기화
+        if now - self._interval_start >= self.INTERVAL_SEC:
+            if self._interval_blinks > self.BLINK_HIGH_PER10:
+                self._last_status = "hyper"
+            elif self._interval_blinks <= self.BLINK_LOW_PER10:
+                self._last_status = "rigid"
+            else:
+                self._last_status = "normal"
+            self._interval_start  = now
+            self._interval_blinks = 0
+
+        # BPM 표시용 (60초 rolling)
         while self._blink_times and self._blink_times[0] < now - 60.0:
             self._blink_times.popleft()
-
         elapsed_window = min(now, 60.0) if now > 0 else 1.0
         bpm = len(self._blink_times) / elapsed_window * 60.0
 
-        unstable = not (BLINK_BPM_LOW <= bpm <= BLINK_BPM_HIGH)
+        unstable = self._last_status != "normal"
         return bpm, unstable, blinked
 
 
@@ -456,8 +515,10 @@ class SessionRecorder:
         print(f"  Posture Score    : {score_engine.posture_score:.1f} / 100")
         print(f"  Expression Score : {score_engine.expr_score:.1f} / 100")
         print(f"  TOTAL SCORE      : {score_engine.total_score:.1f} / 100")
+        lo = BlinkAnalyzer.BLINK_LOW_PER10  * 6   # 10초 기준 → 분당 환산
+        hi = BlinkAnalyzer.BLINK_HIGH_PER10 * 6
         print(f"  Avg Blink Rate   : {total_bpm:.1f} /min  "
-              f"(normal: {BLINK_BPM_LOW}~{BLINK_BPM_HIGH})")
+              f"(normal: {lo}~{hi})")
         print("-" * 56)
 
         def find_unstable_intervals(stable_log, timestamps, min_dur=1.5):
@@ -545,7 +606,7 @@ def draw_status_bar(frame, gaze_ratio, shoulder_angle, emotion,
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
     text = (f"FPS {fps:4.1f}  |  "
-            f"Gaze H {gaze_ratio[0]:.2f} V {gaze_ratio[1]:.2f}  |  "
+            f"Gaze X:{gaze_ratio[0]:.0f} Y:{gaze_ratio[1]:.0f}  |  "
             f"Shoulder {shoulder_angle:.1f}deg  |  "
             f"Expr: {emotion:<9}|  "
             f"Head Y:{yaw:+.0f} P:{pitch:+.0f} R:{roll:+.0f}  |  "
@@ -673,10 +734,11 @@ def main():
             bpm              = 0.0;    blink_unstable   = False
             face_lm          = None
 
+            gaze_safe_zone = None
             if face_result.multi_face_landmarks:
                 face_lm = face_result.multi_face_landmarks[0]
-                gaze_warn, gaze_ratio, gaze_unstable = gaze_analyzer.analyze(
-                    face_lm, img_w, img_h)
+                gaze_warn, gaze_ratio, gaze_unstable, gaze_safe_zone = \
+                    gaze_analyzer.analyze(face_lm, img_w, img_h, now)
                 head_warn, yaw, pitch, roll, head_unstable = head_analyzer.analyze(
                     face_lm, img_w, img_h)
                 bpm, blink_unstable, _ = blink_analyzer.analyze(
@@ -684,7 +746,8 @@ def main():
 
             if pose_result.pose_landmarks:
                 posture_warn, shoulder_ang, pose_issues, posture_unstable = \
-                    posture_analyzer.analyze(pose_result.pose_landmarks)
+                    posture_analyzer.analyze(pose_result.pose_landmarks, now,
+                                             face_lm, img_w, img_h)
 
             emotion, expr_unstable_raw = expr_analyzer.get_state()
             expr_warn     = expr_analyzer.update_history(expr_unstable_raw)
@@ -700,6 +763,21 @@ def main():
 
             # ── 랜드마크 시각화 ──────────────────────────────────────────
             draw_landmarks(frame, face_lm, pose_result.pose_landmarks)
+
+            # ── Safe Zone 시각화 ─────────────────────────────────────────
+            if gaze_safe_zone is not None:
+                sx1, sx2, sy1, sy2 = gaze_safe_zone
+                sz_color = (60, 60, 220) if gaze_unstable else (60, 200, 60)
+                cv2.rectangle(frame, (sx1, sy1), (sx2, sy2), sz_color, 2, cv2.LINE_AA)
+                cv2.putText(frame, "Safe Zone", (sx1 + 4, sy2 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, sz_color, 1, cv2.LINE_AA)
+                # 홍채 중심 점
+                ix, iy = int(gaze_ratio[0]), int(gaze_ratio[1])
+                cv2.circle(frame, (ix, iy), 5, sz_color, -1, cv2.LINE_AA)
+                # 이탈 이벤트 카운트
+                cv2.putText(frame, f"Gaze out: {gaze_analyzer.deviate_events}/5",
+                            (sx1 + 4, max(sy2 + 18, 20)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, sz_color, 1, cv2.LINE_AA)
 
             # ── 우측 상태 패널 (경고 박스 대체) ─────────────────────────
             panel_states = {

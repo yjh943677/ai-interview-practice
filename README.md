@@ -27,11 +27,11 @@
 
 | 기능 | 설명 |
 |------|------|
-| 👁️ **시선 분석** | MediaPipe FaceMesh 홍채 중심 추적. 연속 3프레임 이상 이탈 시 불안정 판정 |
-| 🧍 **자세 분석** | 어깨 기울기 각도(±10°) + 손 위치 감지 |
+| 👁️ **시선 분석** | FaceMesh 홍채 픽셀 좌표 → 화면 중앙 상단 Safe Zone(가로 40%, 세로 35%) 기준. 연속 3초 이탈 시 1회 카운트, 5회 이상 경고 (Rogers et al., 2018) |
+| 🧍 **자세 분석** | 어깨 기울기 ±10° 5초 지속 시 불안정 판정 + 손목·손가락이 FaceMesh 바운딩박스 침범 3회 이상 경고 |
 | 😊 **표정 분석** | DeepFace 백그라운드 스레드 실행. angry/fear/sad → 불안정, neutral/happy → 안정 |
 | 🙆 **고개 기울기** | solvePnP로 yaw(±20°) / pitch(±15°) / roll(±10°) 실시간 추정 |
-| 👀 **눈 깜빡임** | EAR 기반 감지. 정상 범위 10~25회/분. 범위 이탈 시 경고 |
+| 👀 **눈 깜빡임** | EAR(임계값 0.20) 기반 10초 단위 구간 판정. 7회 초과 → 과긴장, 1회 이하 → 긴장 경직 (Bentivoglio 1997, Haak 2008, Doughty 2001) |
 | 🎬 **카운트다운** | 면접 시작 전 3초 카운트다운 (분석 미포함) |
 | 📊 **실시간 UI** | 우측 상단 상태 패널 (초록 ● 안정 / 빨강 ● 불안정) |
 | 🏆 **종합 점수** | 시선 30% + 자세 40% + 표정 30% 가중합산 |
@@ -44,8 +44,8 @@
 ```
 interview_app.py
 │
-├── GazeAnalyzer          # 홍채 비율 계산 → 시선 안정성 판정
-├── PostureAnalyzer       # 어깨 각도 + 손 위치 → 자세 안정성 판정
+├── GazeAnalyzer          # 홍채 픽셀 좌표 + Safe Zone → 시선 안정성 판정
+├── PostureAnalyzer       # 어깨 각도(5초 지속) + FaceMesh 바운딩박스 손 침범 → 자세 안정성 판정
 ├── ExpressionAnalyzer    # DeepFace 백그라운드 스레드 → 표정 안정성 판정
 ├── HeadPoseAnalyzer      # solvePnP yaw/pitch/roll → 고개 안정성 판정
 ├── BlinkAnalyzer         # EAR 기반 눈 깜빡임 → BPM 계산 및 판정
@@ -181,11 +181,11 @@ Launch → 3-second countdown → Real-time analysis → Press q → Auto report
 
 | Feature | Description |
 |---------|-------------|
-| 👁️ **Gaze Analysis** | MediaPipe FaceMesh iris tracking. Unstable if deviation lasts 3+ consecutive frames |
-| 🧍 **Posture Analysis** | Shoulder tilt angle (±10°) + hand position detection |
+| 👁️ **Gaze Analysis** | FaceMesh iris pixel coordinates vs. Safe Zone (center-top 40% × 35%). 3-second continuous deviation = 1 event; 5+ events → warning (Rogers et al., 2018) |
+| 🧍 **Posture Analysis** | Shoulder tilt ±10° flagged only after 5 s persistence + wrist/finger entering FaceMesh bounding box 3+ times → warning |
 | 😊 **Expression Analysis** | DeepFace in background thread. angry/fear/sad → unstable, neutral/happy → stable |
 | 🙆 **Head Pose** | Real-time yaw(±20°) / pitch(±15°) / roll(±10°) via solvePnP |
-| 👀 **Blink Rate** | EAR-based detection. Normal range: 10~25 BPM |
+| 👀 **Blink Rate** | EAR(threshold 0.20), 10-second intervals. >7 blinks → hyper-tension; ≤1 blink → rigid tension (Bentivoglio 1997, Haak 2008, Doughty 2001) |
 | 🎬 **Countdown** | 3-second countdown before session starts (no analysis during countdown) |
 | 📊 **Live UI** | Top-right status panel (green ● stable / red ● unstable) |
 | 🏆 **Total Score** | Weighted sum: Gaze 30% + Posture 40% + Expression 30% |
@@ -198,8 +198,8 @@ Launch → 3-second countdown → Real-time analysis → Press q → Auto report
 ```
 interview_app.py
 │
-├── GazeAnalyzer          # Iris ratio calculation → gaze stability
-├── PostureAnalyzer       # Shoulder angle + hand position → posture stability
+├── GazeAnalyzer          # Iris pixel coords + Safe Zone → gaze stability
+├── PostureAnalyzer       # Shoulder angle (5 s persist) + FaceMesh bbox hand intrusion → posture stability
 ├── ExpressionAnalyzer    # DeepFace background thread → expression stability
 ├── HeadPoseAnalyzer      # solvePnP yaw/pitch/roll → head stability
 ├── BlinkAnalyzer         # EAR-based blink detection → BPM and stability
